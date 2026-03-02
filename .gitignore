@@ -1,0 +1,23 @@
+# Kaggle credentials
+.kaggle/
+
+# Competition data (Kaggle licensing)
+data/
+*.zip
+
+# Output submissions
+submission_stage1.csv
+submission_stage2.csv
+
+# Claude project files
+.claude/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.DS_Store
