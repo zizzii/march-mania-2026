@@ -196,7 +196,7 @@ def compute_efficiency(detailed_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_winrate_compact(compact_df: pd.DataFrame) -> pd.DataFrame:
-    """Win rate and average margin from compact results (fallback for seasons without detailed data)."""
+    """Win rate, average margin, and margin consistency from compact results."""
     df = compact_df.copy()
     df['Margin'] = df.WScore - df.LScore
     w = df[['Season', 'WTeamID', 'Margin']].rename(columns={'WTeamID': 'TeamID'})
@@ -208,8 +208,10 @@ def compute_winrate_compact(compact_df: pd.DataFrame) -> pd.DataFrame:
     agg = games.groupby(['Season', 'TeamID']).agg(
         WinRate=('Win', 'mean'),
         AvgMargin=('Margin', 'mean'),
+        MarginStd=('Margin', 'std'),
         Games=('Win', 'count'),
     ).reset_index()
+    agg['MarginStd'] = agg['MarginStd'].fillna(0)
     return agg
 
 
@@ -221,6 +223,9 @@ def compute_recent_form(compact_df: pd.DataFrame, n_games: int = 15) -> pd.DataF
     """
     Win rate and margin in the last n_games of regular season, with exponential
     decay weights (half-life ~5 games) so most recent games matter more.
+
+    Also computes Momentum: difference between last-5-game margin and season
+    average margin. Positive = team is peaking; negative = team is fading.
     """
     df = compact_df.copy()
     df['Margin'] = df.WScore - df.LScore
@@ -237,6 +242,9 @@ def compute_recent_form(compact_df: pd.DataFrame, n_games: int = 15) -> pd.DataF
     games = pd.concat([w, l], ignore_index=True)
     games = games.sort_values(['Season', 'TeamID', 'DayNum'])
 
+    # Season-average margin for momentum calculation
+    season_avg = games.groupby(['Season', 'TeamID'])['Margin'].mean().rename('SeasonAvgMargin')
+
     # Keep last n_games per team per season (sorted oldest → newest)
     recent = games.groupby(['Season', 'TeamID']).tail(n_games).copy()
 
@@ -245,12 +253,18 @@ def compute_recent_form(compact_df: pd.DataFrame, n_games: int = 15) -> pd.DataF
         # Oldest game gets exp(-0.14*(n-1)), most recent gets exp(0)=1
         weights = np.exp(-0.14 * np.arange(n - 1, -1, -1))
         weights /= weights.sum()
+        # Last 5 games average margin for momentum
+        last5_margin = group['Margin'].values[-5:].mean() if n >= 5 else group['Margin'].values.mean()
         return pd.Series({
             'RecentWinRate': float(np.dot(group['Win'].values, weights)),
             'RecentMargin': float(np.dot(group['Margin'].values, weights)),
+            'Last5Margin': float(last5_margin),
         })
 
     result = recent.groupby(['Season', 'TeamID']).apply(ewm_agg).reset_index()
+    result = result.merge(season_avg.reset_index(), on=['Season', 'TeamID'], how='left')
+    result['Momentum'] = result['Last5Margin'] - result['SeasonAvgMargin']
+    result = result.drop(columns=['Last5Margin', 'SeasonAvgMargin'])
     return result
 
 
@@ -342,6 +356,53 @@ def compute_sos(compact_df: pd.DataFrame, elo_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# OPPONENT-ADJUSTED EFFICIENCY (Simple Rating System)
+# ---------------------------------------------------------------------------
+
+def compute_srs(compact_df: pd.DataFrame, n_iter: int = 10) -> pd.DataFrame:
+    """
+    Simple Rating System: iteratively adjust team ratings for opponent quality.
+    SRS = AvgMargin + AvgOpponentSRS (converges in ~10 iterations).
+
+    This separates teams with inflated margins from weak schedules vs.
+    teams that dominate strong schedules. More predictive than raw margin
+    for tournament outcomes where all opponents are quality teams.
+    """
+    df = compact_df.copy()
+    df['Margin'] = df.WScore - df.LScore
+
+    # Build game-level data
+    w = df[['Season', 'WTeamID', 'LTeamID', 'Margin']].rename(
+        columns={'WTeamID': 'TeamID', 'LTeamID': 'OppID'})
+    l = df[['Season', 'LTeamID', 'WTeamID', 'Margin']].rename(
+        columns={'LTeamID': 'TeamID', 'WTeamID': 'OppID'})
+    l['Margin'] = -l['Margin']
+    games = pd.concat([w, l], ignore_index=True)
+
+    avg_margin = games.groupby(['Season', 'TeamID'])['Margin'].mean()
+
+    # Initialize SRS with average margin
+    srs = avg_margin.copy().rename('SRS')
+
+    for _ in range(n_iter):
+        # For each game, look up opponent SRS
+        opp_srs = games.merge(
+            srs.reset_index().rename(columns={'TeamID': 'OppID'}),
+            on=['Season', 'OppID'], how='left'
+        )
+        avg_opp_srs = opp_srs.groupby(['Season', 'TeamID'])['SRS'].mean()
+        srs = avg_margin + avg_opp_srs.reindex(avg_margin.index, fill_value=0)
+        srs.name = 'SRS'
+
+    result = srs.reset_index()
+    # Season-normalize
+    season_mean = result.groupby('Season')['SRS'].transform('mean')
+    season_std = result.groupby('Season')['SRS'].transform('std').clip(lower=0.1)
+    result['SRS_z'] = (result['SRS'] - season_mean) / season_std
+    return result
+
+
+# ---------------------------------------------------------------------------
 # CONFERENCE TOURNAMENT PERFORMANCE
 # ---------------------------------------------------------------------------
 
@@ -356,6 +417,34 @@ def compute_conf_tourney(conf_tourney_df: pd.DataFrame) -> pd.DataFrame:
               .reset_index(name='ConfTourneyWins')
               .rename(columns={'WTeamID': 'TeamID'}))
     return wins
+
+
+# ---------------------------------------------------------------------------
+# TOURNAMENT EXPERIENCE
+# ---------------------------------------------------------------------------
+
+def compute_tourney_experience(seeds_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Count how many NCAA tournament appearances each team has had in the
+    prior 5 seasons (rolling window). Teams with tournament pedigree
+    perform better under single-elimination pressure.
+    """
+    seeds = seeds_df[['Season', 'TeamID']].drop_duplicates()
+    seeds = seeds.sort_values('Season')
+
+    all_seasons = sorted(seeds.Season.unique())
+    records = []
+
+    for season in all_seasons:
+        # Count appearances in the 5 seasons before this one
+        window = seeds[(seeds.Season >= season - 5) & (seeds.Season < season)]
+        exp = window.groupby('TeamID').size().reset_index(name='TourneyExp')
+        exp['Season'] = season
+        records.append(exp)
+
+    if not records:
+        return pd.DataFrame(columns=['Season', 'TeamID', 'TourneyExp'])
+    return pd.concat(records, ignore_index=True)
 
 
 # ---------------------------------------------------------------------------
@@ -494,6 +583,12 @@ def build_team_features(gender: str = 'M') -> pd.DataFrame:
     # Strength of schedule
     sos_df = compute_sos(compact, elo_df)
 
+    # Opponent-adjusted efficiency (SRS)
+    srs_df = compute_srs(compact)
+
+    # Tournament experience (rolling 5-year window)
+    tourney_exp_df = compute_tourney_experience(seeds_raw)
+
     # Efficiency from detailed (2003+ for M, 2010+ for W)
     det_path = f'data/{prefix}RegularSeasonDetailedResults.csv'
     try:
@@ -523,11 +618,14 @@ def build_team_features(gender: str = 'M') -> pd.DataFrame:
 
     # Merge everything
     base = elo_df.merge(
-        wr_compact[['Season', 'TeamID', 'WinRate', 'AvgMargin', 'Games']],
+        wr_compact[['Season', 'TeamID', 'WinRate', 'AvgMargin', 'MarginStd', 'Games']],
         on=['Season', 'TeamID'], how='left'
     )
     base = base.merge(recent_df, on=['Season', 'TeamID'], how='left')
     base = base.merge(sos_df, on=['Season', 'TeamID'], how='left')
+    base = base.merge(srs_df, on=['Season', 'TeamID'], how='left')
+    base = base.merge(tourney_exp_df, on=['Season', 'TeamID'], how='left')
+    base['TourneyExp'] = base['TourneyExp'].fillna(0)
     if not conf_wins.empty:
         base = base.merge(conf_wins, on=['Season', 'TeamID'], how='left')
 
