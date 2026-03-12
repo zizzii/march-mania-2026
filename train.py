@@ -15,6 +15,7 @@ import numpy as np
 import xgboost as xgb
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.isotonic import IsotonicRegression
 from sklearn.pipeline import Pipeline
 from sklearn.metrics import log_loss
 import warnings
@@ -29,17 +30,19 @@ from features import build_team_features, compute_seed_matchup_rates, parse_seed
 
 # All possible difference features (used for XGB fallback / exploration)
 ALL_DIFF_FEATURES = [
-    'Elo', 'WinRate', 'AvgMargin', 'RecentWinRate', 'RecentMargin',
-    'SOS', 'ConfTourneyWins',
+    'Elo', 'WinRate', 'AvgMargin', 'MarginStd', 'RecentWinRate', 'RecentMargin',
+    'SOS', 'ConfTourneyWins', 'Momentum', 'SRS', 'SRS_z', 'TourneyExp',
     'OffRtg', 'DefRtg', 'NetRtg', 'OffRtg_z', 'DefRtg_z', 'NetRtg_z', 'Tempo',
     'FGPct', 'FG3Pct', 'FTPct', 'OR', 'DR', 'Ast', 'TO', 'Stl', 'Blk',
     'MasseyMean', 'MasseyStd', 'MasseyMin',
     'Rank_KPK', 'Rank_MOR', 'Rank_NET', 'Rank_POM', 'SeedNum',
-    # New: Four Factors + neutral-site efficiency
+    # Four Factors + neutral-site efficiency
     'eFG', 'TOVPct', 'FTR', 'ORBPct', 'NeutralNetRtg_z',
 ]
 
 # Core features for LR — fewest features that give best CV (validated)
+# Added SRS_z (opponent-adjusted efficiency) which provides schedule-adjusted
+# signal beyond raw Elo/SOS; kept feature count low to avoid overfitting
 LR_CORE_FEATURES = [
     'Elo', 'MasseyMean', 'MasseyMin', 'SeedNum',
     'WinRate', 'AvgMargin', 'SOS', 'NetRtg_z',
@@ -120,31 +123,39 @@ def make_lr_pipeline(C=1.0):
     ])
 
 
-def make_xgb(n_estimators=400):
-    return xgb.XGBClassifier(
+def make_xgb(n_estimators=400, early_stopping_rounds=None):
+    params = dict(
         n_estimators=n_estimators,
-        max_depth=4,
+        max_depth=3,
         learning_rate=0.04,
         subsample=0.8,
-        colsample_bytree=0.75,
-        min_child_weight=3,
-        gamma=0.05,
-        reg_alpha=0.05,
-        reg_lambda=1.0,
+        colsample_bytree=0.7,
+        min_child_weight=5,
+        gamma=0.1,
+        reg_alpha=0.1,
+        reg_lambda=1.5,
         use_label_encoder=False,
         eval_metric='logloss',
         random_state=42,
         tree_method='hist',
     )
+    if early_stopping_rounds is not None:
+        params['early_stopping_rounds'] = early_stopping_rounds
+    return xgb.XGBClassifier(**params)
 
 
-def ensemble_predict(lr_pipeline, xgb_model, X_lr, X_xgb, xgb_weight=XGB_BLEND):
-    """Predict using LR pipeline (poly+scale+lr) + optional XGB blend."""
+def ensemble_predict(lr_pipeline, xgb_model, X_lr, X_xgb,
+                     xgb_weight=XGB_BLEND, iso_calibrator=None):
+    """Predict using LR pipeline (poly+scale+lr) + optional XGB blend + optional isotonic calibration."""
     p_lr = np.clip(lr_pipeline.predict_proba(X_lr)[:, 1], CLIP_LO, CLIP_HI)
     if xgb_model is not None and xgb_weight > 0:
         p_xgb = np.clip(xgb_model.predict_proba(X_xgb)[:, 1], CLIP_LO, CLIP_HI)
-        return np.clip((1 - xgb_weight) * p_lr + xgb_weight * p_xgb, CLIP_LO, CLIP_HI)
-    return p_lr
+        p = np.clip((1 - xgb_weight) * p_lr + xgb_weight * p_xgb, CLIP_LO, CLIP_HI)
+    else:
+        p = p_lr
+    if iso_calibrator is not None:
+        p = np.clip(iso_calibrator.predict(p), CLIP_LO, CLIP_HI)
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -176,7 +187,11 @@ def train_and_evaluate(gender: str = 'M', eval_years: int = 5):
 
     all_seasons = sorted(matchups.Season.unique())
     test_seasons = all_seasons[-eval_years:]
-    cv_scores_lr, cv_scores_blend = [], []
+    cv_scores_lr, cv_scores_blend, cv_scores_calib = [], [], []
+
+    # Collect out-of-fold predictions for isotonic calibration
+    oof_preds = []
+    oof_labels = []
 
     for test_season in test_seasons:
         train_df = matchups[matchups.Season < test_season]
@@ -196,21 +211,51 @@ def train_and_evaluate(gender: str = 'M', eval_years: int = 5):
         lr_pipe.fit(X_tr_lr, y_tr)
         p_lr = np.clip(lr_pipe.predict_proba(X_te_lr)[:, 1], CLIP_LO, CLIP_HI)
 
-        xgb_m = make_xgb()
-        xgb_m.fit(X_tr_xgb, y_tr)
+        # XGB with early stopping using a holdout from training data
+        xgb_m = make_xgb(early_stopping_rounds=30)
+        # Use most recent training season as validation for early stopping
+        prev_season = test_season - 1
+        xgb_tr = train_df[train_df.Season < prev_season]
+        xgb_val = train_df[train_df.Season == prev_season]
+        if len(xgb_val) > 10:
+            xgb_m.fit(xgb_tr[all_feats], xgb_tr['Label'],
+                       eval_set=[(xgb_val[all_feats], xgb_val['Label'])],
+                       verbose=False)
+        else:
+            xgb_m = make_xgb()
+            xgb_m.fit(X_tr_xgb, y_tr)
+
         p_blend = np.clip(ensemble_predict(lr_pipe, xgb_m, X_te_lr, X_te_xgb), CLIP_LO, CLIP_HI)
 
         ll_lr = log_loss(y_te, p_lr)
         ll_blend = log_loss(y_te, p_blend)
         cv_scores_lr.append(ll_lr)
         cv_scores_blend.append(ll_blend)
+
+        # Collect for calibration
+        oof_preds.extend(p_lr.tolist())
+        oof_labels.extend(y_te.tolist())
+
         print(f"  {test_season}: LR={ll_lr:.4f}  Blend={ll_blend:.4f}  (n={len(y_te)})")
 
     mean_lr = np.mean(cv_scores_lr)
     mean_blend = np.mean(cv_scores_blend)
-    best_cv = min(mean_lr, mean_blend)
-    print(f"\nMean CV — LR: {mean_lr:.4f}  Blend: {mean_blend:.4f}  → Using: {'LR' if mean_lr <= mean_blend else 'Blend'}")
+
+    # Test isotonic calibration on OOF predictions
+    oof_preds_arr = np.array(oof_preds)
+    oof_labels_arr = np.array(oof_labels)
+    iso_reg = IsotonicRegression(y_min=CLIP_LO, y_max=CLIP_HI, out_of_bounds='clip')
+    iso_reg.fit(oof_preds_arr, oof_labels_arr)
+    oof_calib = iso_reg.predict(oof_preds_arr)
+    mean_calib = log_loss(oof_labels_arr, oof_calib)
+
+    best_cv = min(mean_lr, mean_blend, mean_calib)
     use_blend = mean_blend < mean_lr
+    use_calibration = mean_calib < min(mean_lr, mean_blend)
+    base_name = 'Blend' if use_blend else 'LR'
+    final_name = f'{base_name}+Calib' if use_calibration else base_name
+    print(f"\nMean CV — LR: {mean_lr:.4f}  Blend: {mean_blend:.4f}  Calib(LR): {mean_calib:.4f}")
+    print(f"  → Using: {final_name}")
 
     # Final model on ALL data
     X_all_lr = matchups[lr_feats].fillna(0)
@@ -225,6 +270,9 @@ def train_and_evaluate(gender: str = 'M', eval_years: int = 5):
         final_xgb = make_xgb(500)
         final_xgb.fit(X_all_xgb, y_all)
 
+    # Fit final isotonic calibration on all training data OOF (already computed)
+    final_iso = iso_reg if use_calibration else None
+
     # Show LR base-feature coefficients (first 8 from the 36-feature poly expansion)
     lr_step = final_lr_pipe.named_steps['lr']
     poly_step = final_lr_pipe.named_steps['poly']
@@ -234,7 +282,7 @@ def train_and_evaluate(gender: str = 'M', eval_years: int = 5):
     for fname, coef in fi[:12]:
         print(f"  {fname}: {coef:+.4f}")
 
-    return final_lr_pipe, final_xgb, lr_feats, all_feats, best_cv, team_feats, seed_matchup_rates
+    return final_lr_pipe, final_xgb, final_iso, lr_feats, all_feats, best_cv, team_feats, seed_matchup_rates
 
 
 # ---------------------------------------------------------------------------
@@ -242,8 +290,8 @@ def train_and_evaluate(gender: str = 'M', eval_years: int = 5):
 # ---------------------------------------------------------------------------
 
 def predict_for_season(sub_template_path: str, season: int,
-                       m_lr_pipe, m_xgb, m_lr_feats, m_all_feats, m_team_feats, m_smr,
-                       w_lr_pipe, w_xgb, w_lr_feats, w_all_feats, w_team_feats, w_smr) -> pd.DataFrame:
+                       m_lr_pipe, m_xgb, m_iso, m_lr_feats, m_all_feats, m_team_feats, m_smr,
+                       w_lr_pipe, w_xgb, w_iso, w_lr_feats, w_all_feats, w_team_feats, w_smr) -> pd.DataFrame:
     """Generate predictions for all matchups in a given season."""
     sub = pd.read_csv(sub_template_path)
     ids = sub.ID.str.split('_', expand=True)
@@ -255,7 +303,7 @@ def predict_for_season(sub_template_path: str, season: int,
     sub_m = sub_s[sub_s.T1 < 2000].copy()
     sub_w = sub_s[sub_s.T1 >= 3000].copy()
 
-    def pred_g(sub_g, team_feats, lr_pipe, xgb_m, lr_feats, all_feats, smr):
+    def pred_g(sub_g, team_feats, lr_pipe, xgb_m, iso_cal, lr_feats, all_feats, smr):
         if len(sub_g) == 0:
             return pd.DataFrame(columns=['ID', 'Pred'])
         f = team_feats[team_feats.Season == season].copy()
@@ -285,11 +333,11 @@ def predict_for_season(sub_template_path: str, season: int,
 
         X_lr = mg[lr_feats].fillna(0)
         X_xgb = mg[[f for f in all_feats if f in mg.columns]]
-        p = ensemble_predict(lr_pipe, xgb_m, X_lr, X_xgb)
+        p = ensemble_predict(lr_pipe, xgb_m, X_lr, X_xgb, iso_calibrator=iso_cal)
         return pd.DataFrame({'ID': mg['ID'].values, 'Pred': p})
 
-    r_m = pred_g(sub_m, m_team_feats, m_lr_pipe, m_xgb, m_lr_feats, m_all_feats, m_smr)
-    r_w = pred_g(sub_w, w_team_feats, w_lr_pipe, w_xgb, w_lr_feats, w_all_feats, w_smr)
+    r_m = pred_g(sub_m, m_team_feats, m_lr_pipe, m_xgb, m_iso, m_lr_feats, m_all_feats, m_smr)
+    r_w = pred_g(sub_w, w_team_feats, w_lr_pipe, w_xgb, w_iso, w_lr_feats, w_all_feats, w_smr)
     return pd.concat([r_m, r_w], ignore_index=True)
 
 
@@ -298,8 +346,8 @@ def predict_for_season(sub_template_path: str, season: int,
 # ---------------------------------------------------------------------------
 
 def main():
-    m_lr_pipe, m_xgb, m_lr_feats, m_all_feats, m_ll, m_team_feats, m_smr = train_and_evaluate('M', 5)
-    w_lr_pipe, w_xgb, w_lr_feats, w_all_feats, w_ll, w_team_feats, w_smr = train_and_evaluate('W', 5)
+    m_lr_pipe, m_xgb, m_iso, m_lr_feats, m_all_feats, m_ll, m_team_feats, m_smr = train_and_evaluate('M', 5)
+    w_lr_pipe, w_xgb, w_iso, w_lr_feats, w_all_feats, w_ll, w_team_feats, w_smr = train_and_evaluate('W', 5)
 
     print(f"\n{'='*55}")
     print(f"Final CV scores:  M={m_ll:.4f}  W={w_ll:.4f}")
@@ -315,8 +363,8 @@ def main():
     for season in seasons_s1:
         result = predict_for_season(
             'data/SampleSubmissionStage1.csv', season,
-            m_lr_pipe, m_xgb, m_lr_feats, m_all_feats, m_team_feats, m_smr,
-            w_lr_pipe, w_xgb, w_lr_feats, w_all_feats, w_team_feats, w_smr,
+            m_lr_pipe, m_xgb, m_iso, m_lr_feats, m_all_feats, m_team_feats, m_smr,
+            w_lr_pipe, w_xgb, w_iso, w_lr_feats, w_all_feats, w_team_feats, w_smr,
         )
         all_preds.append(result)
         print(f"  Season {season}: {len(result)} rows")
@@ -329,8 +377,8 @@ def main():
     print("\nGenerating Stage 2 submission (2026)...")
     result_s2 = predict_for_season(
         'data/SampleSubmissionStage2.csv', 2026,
-        m_lr_pipe, m_xgb, m_lr_feats, m_all_feats, m_team_feats, m_smr,
-        w_lr_pipe, w_xgb, w_lr_feats, w_all_feats, w_team_feats, w_smr,
+        m_lr_pipe, m_xgb, m_iso, m_lr_feats, m_all_feats, m_team_feats, m_smr,
+        w_lr_pipe, w_xgb, w_iso, w_lr_feats, w_all_feats, w_team_feats, w_smr,
     )
     result_s2 = result_s2.sort_values('ID').reset_index(drop=True)
     result_s2.to_csv('submission_stage2.csv', index=False)
