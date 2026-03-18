@@ -47,7 +47,7 @@ Builds per-team, per-season features from raw CSVs. Entry point: `build_team_fea
 | NeutralNetRtg_z | Detailed results | Net rating in non-home games only |
 | Four Factors | Detailed results | eFG%, TOVPct, FTR, ORBPct |
 | Massey consensus | MMasseyOrdinals.csv | Percentile across all ranking systems + KPK/POM/NET/MOR |
-| SeedNum | NCAATourneySeeds.csv | Imputed from Massey rank for 2026 until bracket release |
+| SeedNum | NCAATourneySeeds.csv | Real 2026 seeds loaded (bracket released 2026-03-17) |
 | Conf tourney wins | ConferenceTourneyGames.csv | NaN for 2026 (not played yet) |
 
 ### `train.py` — Model & Submission
@@ -63,8 +63,6 @@ These expand to 36 features via `PolynomialFeatures(degree=2, interaction_only=T
 
 **CV strategy**: time-series leave-one-season-out over the last 5 seasons.
 
-## After Selection Sunday (mid-March 2026)
+## After Selection Sunday (2026-03-17 — done)
 
-1. Update `MNCAATourneySeeds.csv` and `WNCAATourneySeeds.csv` with real 2026 seeds
-2. Re-run `python train.py`
-3. SeedNum is the strongest individual feature — real seeds substantially improve Stage 2 predictions
+Real 2026 seeds have been added to `MNCAATourneySeeds.csv` and `WNCAATourneySeeds.csv`. Re-running `python train.py` picks them up automatically — no code changes needed. SeedNum is the strongest individual feature and substantially improves Stage 2 predictions.
