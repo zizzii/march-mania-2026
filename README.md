@@ -4,7 +4,9 @@ NCAA tournament win probability prediction for the [Kaggle March Machine Learnin
 
 **Metric**: Log loss on predicted win probabilities.
 
-## Results
+## Competition Result
+
+**Silver Medal — 48th / 3,462 teams**
 
 | Gender | Model | CV Log Loss |
 |--------|-------|-------------|
